@@ -1,69 +1,86 @@
-// proxy.ts
-
-import { NextRequest, NextResponse } from 'next/server';
-import { cookies } from 'next/headers';
+﻿import { NextRequest, NextResponse } from 'next/server';
 import { parse } from 'cookie';
-import { checkServerSession } from './lib/api/serverApi';
 
-const privateRoutes = ['/profile','/notes'];
+const privateRoutes = ['/profile', '/notes'];
 const publicRoutes = ['/sign-in', '/sign-up'];
+
+type HeadersWithGetSetCookie = Headers & {
+  getSetCookie?: () => string[];
+};
+
+const getSetCookieHeaders = (response: Response): string[] => {
+  const headers = response.headers as HeadersWithGetSetCookie;
+
+  if (typeof headers.getSetCookie === 'function') {
+    return headers.getSetCookie();
+  }
+
+  const single = response.headers.get('set-cookie');
+  return single ? [single] : [];
+};
+
+const applySetCookieHeaders = (response: NextResponse, setCookies: string[]) => {
+  for (const cookieStr of setCookies) {
+    const parsed = parse(cookieStr);
+    const cookieName = Object.keys(parsed)[0];
+    const cookieValue = cookieName ? parsed[cookieName] : undefined;
+
+    if (!cookieName || typeof cookieValue !== 'string') continue;
+
+    response.cookies.set(cookieName, cookieValue, {
+      expires: parsed.Expires ? new Date(parsed.Expires) : undefined,
+      path: parsed.Path || '/',
+      maxAge: parsed['Max-Age'] ? Number(parsed['Max-Age']) : undefined,
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+    });
+  }
+};
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
-  const cookieStore = await cookies();
-  const accessToken = cookieStore.get('accessToken')?.value;
-  const refreshToken = cookieStore.get('refreshToken')?.value;
+  const accessToken = request.cookies.get('accessToken')?.value;
+  const refreshToken = request.cookies.get('refreshToken')?.value;
 
   const isPublicRoute = publicRoutes.some((route) => pathname.startsWith(route));
   const isPrivateRoute = privateRoutes.some((route) => pathname.startsWith(route));
 
-  // 1. Якщо accessToken відсутній
   if (!accessToken) {
     if (refreshToken) {
       try {
-        // Отримуємо дані сесії
-        const response = await checkServerSession();
+        const sessionResponse = await fetch(new URL('/api/auth/session', request.url), {
+          method: 'GET',
+          headers: {
+            cookie: request.headers.get('cookie') || '',
+          },
+          cache: 'no-store',
+        });
 
-        // ПЕРЕВІРКА: чи повернулися заголовки (усуваємо TypeError: reading 'set-cookie')
-        if (response?.headers && response.headers['set-cookie']) {
-          const setCookie = response.headers['set-cookie'];
-          const cookieArray = Array.isArray(setCookie) ? setCookie : [setCookie];
+        if (sessionResponse.ok) {
+          const data = (await sessionResponse.json()) as { success?: boolean };
 
-          for (const cookieStr of cookieArray) {
-            const parsed = parse(cookieStr);
-            const options = {
-              expires: parsed.Expires ? new Date(parsed.Expires) : undefined,
-              path: parsed.Path || '/',
-              maxAge: parsed['Max-Age'] ? Number(parsed['Max-Age']) : undefined,
-              httpOnly: true,
-              secure: process.env.NODE_ENV === 'production',
-              sameSite: 'lax' as const,
-            };
+          if (data.success) {
+            const response = isPublicRoute
+              ? NextResponse.redirect(new URL('/profile', request.url))
+              : NextResponse.next();
 
-            if (parsed.accessToken) cookieStore.set('accessToken', parsed.accessToken, options);
-            if (parsed.refreshToken) cookieStore.set('refreshToken', parsed.refreshToken, options);
+            applySetCookieHeaders(response, getSetCookieHeaders(sessionResponse));
+            return response;
           }
-
-          // Якщо сесія успішно оновлена і це публічний маршрут (Login/Register) -> на профіль
-          if (isPublicRoute) {
-            return NextResponse.redirect(new URL('/profile', request.url));
-          }
-          // Якщо приватний -> дозволяємо прохід з новими куками
-          return NextResponse.next();
         }
       } catch (error) {
-        console.error("Proxy session refresh failed:", error);
+        console.error('Proxy session refresh failed:', error);
       }
     }
 
-    // Якщо токенів немає або оновлення не вдалося:
     if (isPrivateRoute) {
       return NextResponse.redirect(new URL('/sign-in', request.url));
     }
+
     return NextResponse.next();
   }
 
-  // 2. Якщо accessToken існує (користувач вже в системі)
   if (isPublicRoute) {
     return NextResponse.redirect(new URL('/profile', request.url));
   }
@@ -72,10 +89,5 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
- matcher: [
-    '/profile/:path*', 
-    '/notes/:path*', 
-    '/sign-in', 
-    '/sign-up'
-  ],
+  matcher: ['/profile/:path*', '/notes/:path*', '/sign-in', '/sign-up'],
 };
